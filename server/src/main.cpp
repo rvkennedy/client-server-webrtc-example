@@ -11,10 +11,15 @@
 #include <rapidjson/document.h>
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
-#include <webrtc/api/peerconnectioninterface.h>
-#include <webrtc/base/physicalsocketserver.h>
-#include <webrtc/base/ssladapter.h>
-#include <webrtc/base/thread.h>
+#include <api/peerconnectioninterface.h>
+#include <api/audio_codecs/builtin_audio_encoder_factory.h>
+#include <api/audio_codecs/builtin_audio_decoder_factory.h>
+#include <media/engine/multiplexcodecfactory.h>
+#include <media/engine/internalencoderfactory.h>
+#include <media/engine/internaldecoderfactory.h>
+#include <rtc_base/physicalsocketserver.h>
+#include <rtc_base/ssladapter.h>
+#include <rtc_base/thread.h>
 
 #include <websocketpp/config/asio_no_tls.hpp>
 #include <websocketpp/server.hpp>
@@ -40,12 +45,13 @@ typedef WebSocketServer::message_ptr message_ptr;
 WebSocketServer ws_server;
 // The peer conncetion factory that sets up signaling and worker threads. It is also used to create
 // the PeerConnection.
-rtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> peer_connection_factory;
+rtc::scoped_refptr<webrtc::PeerConnectionFactoryInterface> g_peer_connection_factory;
 // The socket that the signaling thread and worker thread communicate on.
 rtc::PhysicalSocketServer socket_server;
 // The separate thread where all of the WebRTC code runs since we use the main thread for the
 // WebSocket listening loop.
-std::thread webrtc_thread;
+std::unique_ptr<rtc::Thread> g_worker_thread;
+std::unique_ptr<rtc::Thread> g_signaling_thread;
 // The WebSocket connection handler that uniquely identifies one of the connections that the
 // WebSocket has open. If you want to have multiple connections, you will need to store more than
 // one of these.
@@ -72,7 +78,8 @@ void OnDataChannelCreated(webrtc::DataChannelInterface* channel) {
 }
 
 // Callback for when the STUN server responds with the ICE candidates.
-void OnIceCandidate(const webrtc::IceCandidateInterface* candidate) {
+void OnIceCandidate(const webrtc::IceCandidateInterface* candidate)
+{
   std::string candidate_str;
   candidate->ToString(&candidate_str);
   rapidjson::Document message_object;
@@ -129,7 +136,8 @@ void OnAnswerCreated(webrtc::SessionDescriptionInterface* desc) {
 }
 
 // Callback for when the WebSocket server receives a message from the client.
-void OnWebSocketMessage(WebSocketServer* /* s */, websocketpp::connection_hdl hdl, message_ptr msg) {
+void OnWebSocketMessage(WebSocketServer* /* s */, websocketpp::connection_hdl hdl, message_ptr msg)
+{
   websocket_connection_handler = hdl;
   rapidjson::Document message_object;
   message_object.Parse(msg->get_payload().c_str());
@@ -145,7 +153,7 @@ void OnWebSocketMessage(WebSocketServer* /* s */, websocketpp::connection_hdl hd
     ice_server.uri = "stun:stun.l.google.com:19302";
     configuration.servers.push_back(ice_server);
 
-    peer_connection = peer_connection_factory->CreatePeerConnection(configuration, nullptr, nullptr,
+    peer_connection = g_peer_connection_factory->CreatePeerConnection(configuration, nullptr, nullptr,
         &peer_connection_observer);
     webrtc::DataChannelInit data_channel_config;
     data_channel_config.ordered = false;
@@ -157,7 +165,7 @@ void OnWebSocketMessage(WebSocketServer* /* s */, websocketpp::connection_hdl hd
     webrtc::SessionDescriptionInterface* session_description(
         webrtc::CreateSessionDescription("offer", sdp, &error));
     peer_connection->SetRemoteDescription(&set_session_description_observer, session_description);
-    peer_connection->CreateAnswer(&create_session_description_observer, nullptr);
+    peer_connection->CreateAnswer(&create_session_description_observer, webrtc::PeerConnectionInterface::RTCOfferAnswerOptions() );
   } else if (type == "candidate") {
     std::string candidate = message_object["payload"]["candidate"].GetString();
     int sdp_mline_index = message_object["payload"]["sdpMLineIndex"].GetInt();
@@ -172,19 +180,45 @@ void OnWebSocketMessage(WebSocketServer* /* s */, websocketpp::connection_hdl hd
 
 // The thread entry point for the WebRTC thread. This sets the WebRTC thread as the signaling thread
 // and creates a worker thread in the background.
-void SignalThreadEntry() {
+#if 0
+// all broken now
+void SignalThreadEntry()
+{
   // Create the PeerConnectionFactory.
   rtc::InitializeSSL();
-  peer_connection_factory = webrtc::CreatePeerConnectionFactory();
+  g_peer_connection_factory =  webrtc::CreatePeerConnectionFactory();
   rtc::Thread* signaling_thread = rtc::Thread::Current();
-  signaling_thread->set_socketserver(&socket_server);
+ // signaling_thread->set_socketserver(&socket_server);
   signaling_thread->Run();
-  signaling_thread->set_socketserver(nullptr);
+  //signaling_thread->set_socketserver(nullptr);
 }
-
+#endif
+void CreatePeerConnectionFactory()
+{
+	if (g_peer_connection_factory == nullptr)
+	{
+		g_worker_thread.reset(new rtc::Thread());
+		g_worker_thread->Start();
+		g_signaling_thread.reset(new rtc::Thread());
+		g_signaling_thread->Start();
+		
+		g_peer_connection_factory = webrtc::CreatePeerConnectionFactory(
+        g_worker_thread.get(), g_worker_thread.get(), g_signaling_thread.get(),
+        nullptr, webrtc::CreateBuiltinAudioEncoderFactory(),
+        webrtc::CreateBuiltinAudioDecoderFactory(),
+        std::unique_ptr<webrtc::VideoEncoderFactory>(
+            new webrtc::MultiplexEncoderFactory(
+                absl::make_unique<webrtc::InternalEncoderFactory>())),
+        std::unique_ptr<webrtc::VideoDecoderFactory>(
+            new webrtc::MultiplexDecoderFactory(
+                absl::make_unique<webrtc::InternalDecoderFactory>())),
+        nullptr, nullptr);
+  }
+}
 // Main entry point of the code.
 int main() {
-  webrtc_thread = std::thread(SignalThreadEntry);
+//  g_signaling_thread = std::thread(SignalThreadEntry);
+	CreatePeerConnectionFactory();
   // In a real game server, you would run the WebSocket server as a separate thread so your main
   // process can handle the game loop.
   ws_server.set_message_handler(bind(OnWebSocketMessage, &ws_server, ::_1, ::_2));
